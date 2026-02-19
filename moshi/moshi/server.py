@@ -347,6 +347,8 @@ def _get_static_path(static: Optional[str]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 def main():
+    global MAX_SESSIONS # Global variable to store the maximum number of sessions
+    
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="localhost", type=str)
     parser.add_argument("--port", default=8998, type=int)
@@ -364,8 +366,7 @@ def main():
     parser.add_argument("--max-sessions", type=int, default=MAX_SESSIONS)
     args = parser.parse_args()
 
-    global MAX_SESSIONS
-    MAX_SESSIONS = args.max_sessions
+    MAX_SESSIONS = args.max_sessions # Update the global variable with the new value
 
     args.voice_prompt_dir = _get_voice_prompt_dir(args.voice_prompt_dir, args.hf_repo)
     if args.voice_prompt_dir:
