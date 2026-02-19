@@ -30,7 +30,7 @@ MAX_SESSIONS = 5
 
 
 # ---------------------------------------------------------------------------
-# Helper functions (original code)
+# Helper functions
 # ---------------------------------------------------------------------------
 
 def torch_auto_device(requested: Optional[DeviceString] = None) -> torch.device:
@@ -65,81 +65,81 @@ def wrap_with_system_tags(text: str) -> str:
 
 class BaseState:
     """
-    LM weights and tokenizer are shared between sessions,
-    totally read-only data. mimi_weight path is also stored here —
-    each session uses this path when creating a new mimi.
+    LM weights and tokenizer are shared between sessions (read-only).
+    mimi_weight is a local file path — each session loads its own mimi from here.
+    mimi_create_lock: concurrent GPU alloc causes CUDA illegal memory access,
+    so mimi creation is serialized.
     """
-    def __init__(
-        self,
-        lm: LMModel,
-        mimi_weight: str,
-        text_tokenizer: sentencepiece.SentencePieceProcessor,
-        device: torch.device,
-        voice_prompt_dir: Optional[str],
-        sample_rate: int,
-        frame_rate: float,
-        frame_size: int,
-    ):
+    def __init__(self, lm, mimi_weight, text_tokenizer, device,
+                 voice_prompt_dir, sample_rate, frame_rate, frame_size):
         self.lm = lm
-        self.mimi_weight = mimi_weight          # local file path
+        self.mimi_weight = mimi_weight
         self.text_tokenizer = text_tokenizer
         self.device = device
         self.voice_prompt_dir = voice_prompt_dir
         self.sample_rate = sample_rate
         self.frame_rate = frame_rate
         self.frame_size = frame_size
+        self.mimi_create_lock = asyncio.Lock()
 
 
 # ---------------------------------------------------------------------------
-# Session-level completely isolated state
+# Session-specific isolated state
 # ---------------------------------------------------------------------------
 
 class SessionContext:
     """
     Each WebSocket connection has its own independent inference context.
     mimi, other_mimi and lm_gen are session-specific and do not mix.
+    initialize() method is async because it can wait for the lock.
     """
-    def __init__(self, ws: web.WebSocketResponse, base: BaseState):
+    def __init__(self, ws, base: BaseState):
         self.ws = ws
         self.base = base
         self.session_id = id(ws)
         self.clog = ColorizedLog.randomize()
-
-        # Each session creates its own mimi instances from local path
-        self.mimi: MimiModel = loaders.get_mimi(base.mimi_weight, base.device)
-        self.other_mimi: MimiModel = loaders.get_mimi(base.mimi_weight, base.device)
-
-        # LMGen session-specific (KV cache and audio buffer stateful)
-        self.lm_gen = LMGen(
-            base.lm,
-            audio_silence_frame_cnt=int(0.5 * base.frame_rate),
-            sample_rate=base.sample_rate,
-            device=base.device,
-            frame_rate=base.frame_rate,
-        )
-
-        # Start streaming mode (original code)
-        self.mimi.streaming_forever(1)
-        self.other_mimi.streaming_forever(1)
-        self.lm_gen.streaming_forever(1)
-
-        # Opus stream I/O
+        self.mimi = None
+        self.other_mimi = None
+        self.lm_gen = None
         self.opus_reader = sphn.OpusStreamReader(base.sample_rate)
         self.opus_writer = sphn.OpusStreamWriter(base.sample_rate)
 
+    async def initialize(self):
+        """
+        Create mimi and LMGen on GPU. mimi_create_lock is serialized —
+        if two sessions create mimi at the same time, CUDA illegal memory access occurs.
+        """
+        base = self.base
+        async with base.mimi_create_lock:
+            self.mimi = loaders.get_mimi(base.mimi_weight, base.device)
+            self.other_mimi = loaders.get_mimi(base.mimi_weight, base.device)
+            self.lm_gen = LMGen(
+                base.lm,
+                audio_silence_frame_cnt=int(0.5 * base.frame_rate),
+                sample_rate=base.sample_rate,
+                device=base.device,
+                frame_rate=base.frame_rate,
+            )
+            self.mimi.streaming_forever(1)
+            self.other_mimi.streaming_forever(1)
+            self.lm_gen.streaming_forever(1)
+
     def reset_streaming(self):
-        """Reset all states before speech starts."""
         self.mimi.reset_streaming()
         self.other_mimi.reset_streaming()
         self.lm_gen.reset_streaming()
 
     def cleanup(self):
-        """Free GPU memory when session is closed."""
+        """
+        Delete references — Python GC will handle it.
+        WARNING: torch.cuda.empty_cache() should not be called here.
+        If called when another session is active, it will corrupt the CUDA state and
+        cause 'illegal memory access' chain.
+        """
         try:
             del self.mimi
             del self.other_mimi
             del self.lm_gen
-            torch.cuda.empty_cache()
         except Exception as e:
             logger.warning(f"[session {self.session_id}] cleanup error: {e}")
 
@@ -160,15 +160,24 @@ async def handle_chat(request: web.Request):
 
     base: BaseState = request.app["base_state"]
     session = SessionContext(ws, base)
+
+    # Create Mimi + LMGen (locked, async)
+    try:
+        await session.initialize()
+    except Exception as e:
+        logger.error(f"Session initialize hatası: {e}")
+        await ws.close()
+        return ws
+
     active_sessions[session.session_id] = session
     clog = session.clog
 
     peer = request.remote
     peer_port = request.transport.get_extra_info("peername")[1]
-    clog.log("info", f"[{session.session_id}] connected {peer}:{peer_port} | "
-                     f"Active sessions: {len(active_sessions)}")
+    clog.log("info", f"[{session.session_id}] bağlandı {peer}:{peer_port} | "
+                     f"Aktif session: {len(active_sessions)}")
 
-    # --- Set voice and text prompt (original code) ---
+    # --- Voice and text prompt ---
     requested_voice_prompt_path = None
     voice_prompt_path = None
     if base.voice_prompt_dir is not None:
@@ -202,7 +211,6 @@ async def handle_chat(request: web.Request):
     if seed is not None and seed != -1:
         seed_all(seed)
 
-    # Reset streaming state
     session.reset_streaming()
 
     close = False
@@ -214,25 +222,18 @@ async def handle_chat(request: web.Request):
                 if message.type == aiohttp.WSMsgType.ERROR:
                     clog.log("error", f"{ws.exception()}")
                     break
-                elif message.type in (
-                    aiohttp.WSMsgType.CLOSED,
-                    aiohttp.WSMsgType.CLOSE,
-                ):
+                elif message.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE):
                     break
                 elif message.type != aiohttp.WSMsgType.BINARY:
-                    clog.log("error", f"unexpected message type {message.type}")
                     continue
                 data = message.data
                 if not isinstance(data, bytes) or len(data) == 0:
                     continue
-                kind = data[0]
-                if kind == 1:  # audio
+                if data[0] == 1:
                     session.opus_reader.append_bytes(data[1:])
-                else:
-                    clog.log("warning", f"unknown kind {kind}")
         finally:
             close = True
-            clog.log("info", f"[{session.session_id}] recv_loop closed")
+            clog.log("info", f"[{session.session_id}] recv_loop kapandı")
 
     async def opus_loop():
         all_pcm_data = None
@@ -253,7 +254,6 @@ async def handle_chat(request: web.Request):
                 with torch.no_grad():
                     codes = session.mimi.encode(chunk)
                     _ = session.other_mimi.encode(chunk)
-
                     for c in range(codes.shape[-1]):
                         tokens = session.lm_gen.step(codes[:, :, c: c + 1])
                         if tokens is None:
@@ -262,7 +262,6 @@ async def handle_chat(request: web.Request):
                         _ = session.other_mimi.decode(tokens[:, 1:9])
                         main_pcm = main_pcm.cpu()
                         session.opus_writer.append_pcm(main_pcm[0, 0].numpy())
-
                         text_token = tokens[0, 0, 0].item()
                         if text_token not in (0, 3):
                             _text = base.text_tokenizer.id_to_piece(text_token).replace("▁", " ")
@@ -270,15 +269,17 @@ async def handle_chat(request: web.Request):
                                 await ws.send_bytes(b"\x02" + bytes(_text, encoding="utf8"))
 
     async def send_loop():
-        while True:
-            if close:
-                return
-            await asyncio.sleep(0.001)
-            msg = session.opus_writer.read_bytes()
-            if len(msg) > 0:
-                await ws.send_bytes(b"\x01" + msg)
+        try:
+            while True:
+                if close:
+                    return
+                await asyncio.sleep(0.001)
+                msg = session.opus_writer.read_bytes()
+                if len(msg) > 0:
+                    await ws.send_bytes(b"\x01" + msg)
+        except (aiohttp.ClientConnectionResetError, aiohttp.ClientError):
+            pass  # Client bağlantıyı kesti — normal durum
 
-    # Send handshake
     await ws.send_bytes(b"\x00")
     clog.log("info", f"[{session.session_id}] handshake sent")
 
@@ -302,13 +303,13 @@ async def handle_chat(request: web.Request):
         if not ws.closed:
             await ws.close()
         clog.log("info", f"[{session.session_id}] session closed | "
-                         f"Aktif session: {len(active_sessions)}")
+                         f"Active sessions: {len(active_sessions)}")
 
     return ws
 
 
 # ---------------------------------------------------------------------------
-# Helper: voice and static path (original code)
+# Helper: voice and static path
 # ---------------------------------------------------------------------------
 
 def _get_voice_prompt_dir(voice_prompt_dir: Optional[str], hf_repo: str) -> Optional[str]:
@@ -347,8 +348,8 @@ def _get_static_path(static: Optional[str]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 def main():
-    global MAX_SESSIONS # Global variable to store the maximum number of sessions
-    
+    global MAX_SESSIONS
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="localhost", type=str)
     parser.add_argument("--port", default=8998, type=int)
@@ -366,7 +367,7 @@ def main():
     parser.add_argument("--max-sessions", type=int, default=MAX_SESSIONS)
     args = parser.parse_args()
 
-    MAX_SESSIONS = args.max_sessions # Update the global variable with the new value
+    MAX_SESSIONS = args.max_sessions
 
     args.voice_prompt_dir = _get_voice_prompt_dir(args.voice_prompt_dir, args.hf_repo)
     if args.voice_prompt_dir:
@@ -374,8 +375,7 @@ def main():
     logger.info(f"voice_prompt_dir = {args.voice_prompt_dir}")
 
     static_path = _get_static_path(args.static)
-    assert static_path is None or os.path.exists(static_path), \
-        f"Static path not found: {static_path}"
+    assert static_path is None or os.path.exists(static_path), f"Static path not found: {static_path}"
     logger.info(f"static_path = {static_path}")
 
     args.device = torch_auto_device(args.device)
@@ -392,20 +392,17 @@ def main():
         setup_tunnel = networking.setup_tunnel
         tunnel_token = args.gradio_tunnel_token or secrets.token_urlsafe(32)
 
-    # Download model weights (local paths)
     hf_hub_download(args.hf_repo, "config.json")
 
     logger.info("loading mimi")
     if args.mimi_weight is None:
         args.mimi_weight = hf_hub_download(args.hf_repo, loaders.MIMI_NAME)
 
-    # Create temporary mimi for frame_size, then delete
     _tmp = loaders.get_mimi(args.mimi_weight, args.device)
     sample_rate = _tmp.sample_rate
     frame_rate  = _tmp.frame_rate
     frame_size  = int(_tmp.sample_rate / _tmp.frame_rate)
     del _tmp
-    torch.cuda.empty_cache()
     logger.info("mimi metadata retrieved")
 
     if args.tokenizer is None:
@@ -421,7 +418,7 @@ def main():
 
     base_state = BaseState(
         lm=lm,
-        mimi_weight=args.mimi_weight,   # lokal path — session'lar bunu kullanacak
+        mimi_weight=args.mimi_weight,
         text_tokenizer=text_tokenizer,
         device=args.device,
         voice_prompt_dir=args.voice_prompt_dir,
@@ -448,6 +445,7 @@ def main():
     if args.ssl is not None:
         ssl_context, protocol = create_ssl_context(args.ssl)
 
+    from .utils.connection import get_lan_ip
     host_ip = args.host if args.host not in ("0.0.0.0", "::", "localhost") else get_lan_ip()
     logger.info(f"Web UI: {protocol}://{host_ip}:{args.port}")
 
