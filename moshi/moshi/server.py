@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
 import argparse
 import asyncio
 from dataclasses import dataclass
@@ -165,7 +168,7 @@ async def handle_chat(request: web.Request):
     try:
         await session.initialize()
     except Exception as e:
-        logger.error(f"Session initialize hatası: {e}")
+        logger.error(f"Session initialize error: {e}")
         await ws.close()
         return ws
 
@@ -174,8 +177,8 @@ async def handle_chat(request: web.Request):
 
     peer = request.remote
     peer_port = request.transport.get_extra_info("peername")[1]
-    clog.log("info", f"[{session.session_id}] bağlandı {peer}:{peer_port} | "
-                     f"Aktif session: {len(active_sessions)}")
+    clog.log("info", f"[{session.session_id}] connected {peer}:{peer_port} | "
+                     f"Active sessions: {len(active_sessions)}")
 
     # --- Voice and text prompt ---
     requested_voice_prompt_path = None
@@ -233,7 +236,7 @@ async def handle_chat(request: web.Request):
                     session.opus_reader.append_bytes(data[1:])
         finally:
             close = True
-            clog.log("info", f"[{session.session_id}] recv_loop kapandı")
+            clog.log("info", f"[{session.session_id}] recv_loop closed")
 
     async def opus_loop():
         all_pcm_data = None
@@ -278,7 +281,7 @@ async def handle_chat(request: web.Request):
                 if len(msg) > 0:
                     await ws.send_bytes(b"\x01" + msg)
         except (aiohttp.ClientConnectionResetError, aiohttp.ClientError):
-            pass  # Client bağlantıyı kesti — normal durum
+            pass  # Client connection closed — normal case
 
     await ws.send_bytes(b"\x00")
     clog.log("info", f"[{session.session_id}] handshake sent")
